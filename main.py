@@ -595,7 +595,15 @@ def start_download_process(config):
                     print(LANG["starting_yt_dlp"])
                     command = ['yt-dlp', '-o', output_template, '--no-warnings', '--progress', video_url_to_download]
 
-                    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', bufsize=1)
+                    process = subprocess.Popen(
+                        command,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        encoding='utf-8',
+                        errors='replace',  # Add error handler for encoding issues
+                        bufsize=1
+                    )
 
                     last_percentage = "-1%"
                     for line in iter(process.stdout.readline, ''):
