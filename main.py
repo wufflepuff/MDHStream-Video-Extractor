@@ -106,6 +106,12 @@ LANG_DE = {
     "error_counting_videos": "Fehler bei der Zählung der Gesamtvideos: {e}",
 }
 
+LANG_DE.update({
+    "settings_5_concurrent": "  5: Anzahl gleichzeitiger Downloads ändern (Aktuell: {count})",
+    "enter_concurrent_count": "Anzahl gleichzeitiger Downloads (1-10): ",
+    "invalid_concurrent_count": "Ungültige Eingabe. Bitte eine Zahl zwischen 1 und 10 eingeben.",
+})
+
 LANG_EN = {
     "welcome": "MDHStream Video Extractor",
     "choose_language": "Choose Language / Sprache wählen",
@@ -199,6 +205,12 @@ LANG_EN = {
     "error_counting_videos": "Error counting total videos: {e}",
 }
 
+LANG_EN.update({
+    "settings_5_concurrent": "  5: Change number of concurrent downloads (Current: {count})",
+    "enter_concurrent_count": "Number of concurrent downloads (1-10): ",
+    "invalid_concurrent_count": "Invalid input. Please enter a number between 1 and 10.",
+})
+
 LANG = LANG_EN # Default to English initially
 
 # --- Config Functions ---
@@ -207,7 +219,8 @@ def load_config():
     default_config = {
         "language": None, # Will prompt user if None
         "download_path": ".",
-        "ublock_path": ""
+        "ublock_path": "",
+        "concurrent_downloads": 1  # Add this line
     }
     if not os.path.exists(CONFIG_FILE):
         save_config(default_config)
@@ -427,6 +440,73 @@ def scrape_all_video_metadata(search_url, total_videos, config):
         if driver:
             driver.quit()
 
+# Add this new function before start_download_process:
+def download_single_video(video, download_dir, index, total):
+    print(f"\n[{index}/{total}] Processing: {video['title']}")
+    print(f"  Page URL: {video['url']}")
+    
+    safe_title = re.sub(r'[\\/*?:"<>|]', "_", video['title']).strip()
+    if not safe_title:
+        safe_title = f"video_{video['original_index']}"
+    
+    # Check if video already exists
+    if os.path.exists(download_dir):
+        for filename in os.listdir(download_dir):
+            if filename.startswith(safe_title + '.') and not filename.endswith(('.part', '.ytdl')):
+                print(f"  Skipping - File already exists: {filename}")
+                return "skipped"
+
+    print("  Extracting video URL...")
+    # Extract video URL
+    driver_dl = create_driver(config)
+    try:
+        video_url = extract_video_url(driver_dl, video['url'])
+        if not video_url:
+            print("  Failed - No video URL found")
+            return "failed"
+
+        print(f"  Starting download...")
+        output_template = os.path.join(download_dir, f'{safe_title}.%(ext)s')
+        command = ['yt-dlp', '-o', output_template, '--no-warnings', '--progress', video_url]
+
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            bufsize=1
+        )
+
+        # Monitor download progress
+        while True:
+            output = process.stdout.readline()
+            if output == '' and process.poll() is not None:
+                break
+            if output:
+                if '[download]' in output:
+                    print(f"  {output.strip()}")
+
+        return_code = process.wait()
+
+        if return_code == 0:
+            print(f"  Success - Download completed: {safe_title}")
+            return "success"
+        else:
+            stderr_output = process.stderr.read()
+            print(f"  Failed - Error code {return_code}")
+            if stderr_output:
+                print(f"  Error details: {stderr_output.strip()}")
+            return "failed"
+
+    except Exception as e:
+        print(f"  Failed - Unexpected error: {str(e)}")
+        return "failed"
+    finally:
+        if driver_dl:
+            driver_dl.quit()
+
 # --- Core Application Logic ---
 def start_download_process(config):
     search_term = input(LANG["search_prompt"]).strip()
@@ -549,107 +629,37 @@ def start_download_process(config):
 
     # --- Download Loop ---
     print(LANG["starting_download"].format(count=len(videos_to_download), path=os.path.abspath(download_dir)))
-    driver_dl = create_driver(config)
 
     download_success_count = 0
     download_fail_count = 0
     download_skip_count = 0
 
-    try:
-        for video in videos_to_download:
-            print(LANG["processing_video"].format(current=video['original_index'], total_all=total, title=video['title']))
+    # Replace the download loop in start_download_process with:
+    concurrent_downloads = config.get("concurrent_downloads", 1)
+    with ThreadPoolExecutor(max_workers=concurrent_downloads) as executor:
+        future_to_video = {
+            executor.submit(
+                download_single_video, 
+                video, 
+                download_dir, 
+                video['original_index'], 
+                total
+            ): video for video in videos_to_download
+        }
 
-            # --- Check if video already exists ---
+        for future in as_completed(future_to_video):
+            video = future_to_video[future]
             try:
-                safe_title = re.sub(r'[\\/*?:"<>|]', "_", video['title']).strip()
-                if not safe_title:
-                    safe_title = f"video_{video['original_index']}"
-
-                file_exists = False
-                # print(LANG["checking_exists"]) # Optional verbose output
-                if os.path.exists(download_dir):
-                    for filename in os.listdir(download_dir):
-                        if filename.startswith(safe_title + '.') and not filename.endswith(('.part', '.ytdl')):
-                            file_exists = True
-                            print(LANG["video_exists"].format(filename=filename))
-                            break
-
-                if file_exists:
+                result = future.result()
+                if result == "success":
+                    download_success_count += 1
+                elif result == "skipped":
                     download_skip_count += 1
-                    continue
-
-            except Exception as e:
-                print(LANG["error_checking_file"].format(e=e))
-                download_fail_count += 1
-                continue
-
-            # --- Proceed with URL extraction and download ---
-            print(LANG["page_url"].format(url=video['url']))
-            # print(LANG["extracting_url"]) # Optional verbose output
-            video_url_to_download = extract_video_url(driver_dl, video['url'])
-
-            if video_url_to_download:
-                print(LANG["video_url_found"].format(url=video_url_to_download))
-                try:
-                    output_template = os.path.join(download_dir, f'{safe_title}.%(ext)s')
-                    print(LANG["starting_yt_dlp"])
-                    command = ['yt-dlp', '-o', output_template, '--no-warnings', '--progress', video_url_to_download]
-
-                    process = subprocess.Popen(
-                        command,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        encoding='utf-8',
-                        errors='replace',  # Add error handler for encoding issues
-                        bufsize=1
-                    )
-
-                    last_percentage = "-1%"
-                    for line in iter(process.stdout.readline, ''):
-                        match = re.search(r'\[download\]\s+(\d+\.\d+)%', line)
-                        if match:
-                            percentage = match.group(1) + "%"
-                            if percentage != last_percentage:
-                                print(LANG["download_progress"].format(percentage=percentage.strip()), end='\r')
-                                sys.stdout.flush()
-                                last_percentage = percentage
-                        else: pass # Ignore other yt-dlp output lines
-
-                    process.stdout.close()
-                    return_code = process.wait()
-                    print() # Newline after progress
-
-                    if return_code == 0:
-                        print(LANG["download_success"].format(title=safe_title))
-                        download_success_count += 1
-                    else:
-                        print(LANG["download_failed"].format(code=return_code))
-                        download_fail_count += 1
-                        stderr_output = process.stderr.read()
-                        if stderr_output:
-                            print(LANG["error_yt_dlp_stderr"].format(stderr=stderr_output.strip()))
-                        process.stderr.close()
-
-                except FileNotFoundError:
-                     print(LANG["error_yt_dlp_not_found"].format(command=command[0]))
-                     download_fail_count += 1
-                     break # Stop if downloader is missing
-                except Exception as e:
-                    print(LANG["error_unexpected_download"].format(e=e))
+                else:
                     download_fail_count += 1
-                    if 'process' in locals() and process.poll() is None:
-                         process.kill(); process.wait()
-                         if process.stdout: process.stdout.close()
-                         if process.stderr: process.stderr.close()
-            else:
-                print(LANG["no_video_url_found"])
+            except Exception as e:
+                print(LANG["error_unexpected_download"].format(e=e))
                 download_fail_count += 1
-
-            time.sleep(1)
-    finally:
-        if driver_dl:
-            driver_dl.quit()
 
     print(LANG["all_videos_processed"])
     print(LANG["summary_success"].format(count=download_success_count))
@@ -658,6 +668,8 @@ def start_download_process(config):
     input("\nDrücke Enter um zum Hauptmenü zurückzukehren / Press Enter to return to main menu...")
 
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 def manage_settings(config):
     global LANG
     while True:
@@ -665,11 +677,13 @@ def manage_settings(config):
         current_lang_name = "Deutsch" if current_lang_code == 'de' else "English"
         current_dl_path = os.path.abspath(config.get("download_path", "."))
         current_ublock_path = config.get("ublock_path", "Nicht gesetzt / Not set")
+        current_concurrent = config.get("concurrent_downloads", 1)
 
         print(LANG["settings_menu"])
         print(LANG["settings_1_language"].format(lang=current_lang_name))
         print(LANG["settings_2_dl_path"].format(path=current_dl_path))
         print(LANG["settings_3_ublock_path"].format(path=current_ublock_path))
+        print(LANG["settings_5_concurrent"].format(count=current_concurrent))
         print(LANG["settings_4_back"])
         choice = input(LANG["settings_prompt"]).strip()
 
@@ -707,6 +721,19 @@ def manage_settings(config):
                  print(LANG["path_not_exist"].format(path=new_path))
             else:
                  print(LANG["path_not_file"].format(path=new_path))
+        elif choice == '5':
+            while True:
+                try:
+                    count = int(input(LANG["enter_concurrent_count"]))
+                    if 1 <= count <= 10:
+                        config["concurrent_downloads"] = count
+                        save_config(config)
+                        print(LANG["settings_saved"])
+                        break
+                    else:
+                        print(LANG["invalid_concurrent_count"])
+                except ValueError:
+                    print(LANG["invalid_concurrent_count"])
         elif choice == '4':
             break
         else:
